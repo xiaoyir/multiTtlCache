@@ -56,6 +56,7 @@ public class CacheReloadAspect {
         //自定义注解
         CustomizedCacheable cacheable = method.getAnnotation(CustomizedCacheable.class);
         String cacheEnabled = cacheable.cacheEnabled();
+        //根据配置判断是否开启缓存
         String property = environment.getProperty(cacheEnabled);
         if (!ObjectUtil.isEmpty(property)) {
             return proceedingJoinPoint.proceed();
@@ -69,103 +70,117 @@ public class CacheReloadAspect {
         }
         //解析SPEL表达式的key，获取真正存入缓存中的key值
         String key = parseSPELKey(cacheable, standardEvaluationContext);
-        //过期时间
-        long expiredTimeSecond = cacheable.expiredTimeSecond();
-        //预刷新时间
-        long preLoadTimeSecond = cacheable.preLoadTimeSecond();
         Object result = null;
         String cacheType = cacheable.cacheType();
-        if (CacheConstant.LOCAL_CACHE.equals(cacheType)) {//本地缓存
-            MyCaffeineCache myCaffeineCache = (MyCaffeineCache) SpringUtil.getBean(MyCaffeineCache.class);
-            Object o = myCaffeineCache.get(key);
-            if (o != null) {
-                Long ttl = myCaffeineCache.getTtl(key);
-                if(ObjectUtil.isNotEmpty(ttl) && ttl <= preLoadTimeSecond){
-                    log.info(">>>>>>>>>>> cacheKey：{}, ttl: {},preLoadTimeSecond: {}",key,ttl,preLoadTimeSecond);
-                    ThreadUtil.execute(()->{
-                        lock.lock();
-                        try{
-                            CachedInvocation cachedInvocation = buildCachedInvocation(proceedingJoinPoint, cacheable);
-                            Object o1 = CacheHelper.exeInvocation(cachedInvocation);
-                            myCaffeineCache.set(key, o1, expiredTimeSecond);
-                        }catch (Exception e){
-                            log.error("{}",e.getMessage(),e);
-                        }finally {
-                            lock.unlock();
-                        }
-                    });
-                }
-                return o;
-            }
-            result = proceedingJoinPoint.proceed();
-            myCaffeineCache.set(key, result, expiredTimeSecond);
-        } else if (CacheConstant.REDIS_CACHE.equals(cacheType)) {//redis缓存
-            RedisTemplate redisTemplate = (RedisTemplate) SpringUtil.getBean("cacheRedisTemplate");
-            Object o = redisTemplate.opsForValue().get(key);
-            if (o != null) {
-                Long ttl = redisTemplate.getExpire(key, TimeUnit.SECONDS);
-                if(ObjectUtil.isNotEmpty(ttl) && ttl <= preLoadTimeSecond){
-                    log.info(">>>>>>>>>>> cacheKey：{}, ttl: {},preLoadTimeSecond: {}",key,ttl,preLoadTimeSecond);
-                    ThreadUtil.execute(()->{
-                        lock.lock();
-                        try{
-                            CachedInvocation cachedInvocation = buildCachedInvocation(proceedingJoinPoint, cacheable);
-                            Object o1 = CacheHelper.exeInvocation(cachedInvocation);
-                            redisTemplate.opsForValue().set(key, o1, expiredTimeSecond, TimeUnit.SECONDS);
-                        }catch (Exception e){
-                            log.error("{}",e.getMessage(),e);
-                        }finally {
-                            lock.unlock();
-                        }
-                    });
-                }
-                return o;
-            }
-            result = proceedingJoinPoint.proceed();
-            redisTemplate.opsForValue().set(key, result, expiredTimeSecond, TimeUnit.SECONDS);
-        } else if (CacheConstant.BOTH_CACHE.equals(cacheType)) {
-            long expiredInterval = cacheable.expiredInterval();
-            MyCaffeineCache myCaffeineCache = (MyCaffeineCache) SpringUtil.getBean(MyCaffeineCache.class);
-            RedisTemplate redisTemplate = (RedisTemplate) SpringUtil.getBean("cacheRedisTemplate");
-            Object o = myCaffeineCache.get(key);
-            if (o != null) {
-                Long ttl = myCaffeineCache.getTtl(key);
-                if(ObjectUtil.isNotEmpty(ttl) && ttl <= preLoadTimeSecond){
-                    log.info(">>>>>>>>>>> cacheKey：{}, ttl: {},preLoadTimeSecond: {}",key,ttl,preLoadTimeSecond);
-                    ThreadUtil.execute(()->{
-                        lock.lock();
-                        try{
-                            CachedInvocation cachedInvocation = buildCachedInvocation(proceedingJoinPoint, cacheable);
-                            Object o1 = CacheHelper.exeInvocation(cachedInvocation);
-                            myCaffeineCache.set(key, o1, expiredTimeSecond);
-                            redisTemplate.opsForValue().set(key, o1, expiredTimeSecond + expiredInterval, TimeUnit.SECONDS);
-                        }catch (Exception e){
-                            log.error("{}",e.getMessage(),e);
-                        }finally {
-                            lock.unlock();
-                        }
-                    });
-                }
-                return o;
-            } else {
-                Object o1 = redisTemplate.opsForValue().get(key);
-                Long ttl = redisTemplate.getExpire(key, TimeUnit.SECONDS);
-                if(o1 != null){
-                    myCaffeineCache.set(key, o1, ttl);
-                    return o1;
-                }
-            }
-            result = proceedingJoinPoint.proceed();
-            myCaffeineCache.set(key, result, expiredTimeSecond);
-            redisTemplate.opsForValue().set(key, result, expiredTimeSecond + expiredInterval, TimeUnit.SECONDS);
-            return result;
-        } else {
-
+        switch (cacheType) {
+            case CacheConstant.LOCAL_CACHE:
+                result = useCaffeineCache(key, cacheable, proceedingJoinPoint);
+            case CacheConstant.REDIS_CACHE:
+                result = useRedisCache(key, cacheable, proceedingJoinPoint);
+            case CacheConstant.BOTH_CACHE:
+                result = useBothCache(key, cacheable, proceedingJoinPoint);
+            default:
+                result = null;
         }
-        //Object result = proceedingJoinPoint.proceed();
         return result;
 
     }
+
+    @SneakyThrows
+    private Object useBothCache(String key, CustomizedCacheable cacheable, ProceedingJoinPoint proceedingJoinPoint) {
+        long expiredInterval = cacheable.expiredInterval();
+        MyCaffeineCache myCaffeineCache = (MyCaffeineCache) SpringUtil.getBean(MyCaffeineCache.class);
+        RedisTemplate redisTemplate = (RedisTemplate) SpringUtil.getBean("cacheRedisTemplate");
+        Object o = myCaffeineCache.get(key);
+        if (o != null) {
+            Long ttl = myCaffeineCache.getTtl(key);
+            if(ObjectUtil.isNotEmpty(ttl) && ttl <= cacheable.preLoadTimeSecond()){
+                log.info(">>>>>>>>>>> cacheKey：{}, ttl: {},preLoadTimeSecond: {}",key,ttl,cacheable.preLoadTimeSecond());
+                ThreadUtil.execute(()->{
+                    lock.lock();
+                    try{
+                        CachedInvocation cachedInvocation = buildCachedInvocation(proceedingJoinPoint, cacheable);
+                        Object o1 = CacheHelper.exeInvocation(cachedInvocation);
+                        myCaffeineCache.set(key, o1, cacheable.expiredTimeSecond());
+                        redisTemplate.opsForValue().set(key, o1, cacheable.expiredTimeSecond() + expiredInterval, TimeUnit.SECONDS);
+                    }catch (Exception e){
+                        log.error("{}",e.getMessage(),e);
+                    }finally {
+                        lock.unlock();
+                    }
+                });
+            }
+            return o;
+        } else {
+            Object o1 = redisTemplate.opsForValue().get(key);
+            Long ttl = redisTemplate.getExpire(key, TimeUnit.SECONDS);
+            if(o1 != null){
+                myCaffeineCache.set(key, o1, ttl);
+                return o1;
+            }
+        }
+        Object result = proceedingJoinPoint.proceed();
+        myCaffeineCache.set(key, result, cacheable.expiredTimeSecond());
+        redisTemplate.opsForValue().set(key, result, cacheable.expiredTimeSecond() + expiredInterval, TimeUnit.SECONDS);
+        return result;
+    }
+
+    @SneakyThrows
+    private Object useRedisCache(String key, CustomizedCacheable cacheable, ProceedingJoinPoint proceedingJoinPoint) {
+        RedisTemplate redisTemplate = (RedisTemplate) SpringUtil.getBean("cacheRedisTemplate");
+        Object o = redisTemplate.opsForValue().get(key);
+        if (o != null) {
+            Long ttl = redisTemplate.getExpire(key, TimeUnit.SECONDS);
+            if(ObjectUtil.isNotEmpty(ttl) && ttl <= cacheable.preLoadTimeSecond()){
+                log.info(">>>>>>>>>>> cacheKey：{}, ttl: {},preLoadTimeSecond: {}", key, ttl, cacheable.preLoadTimeSecond());
+                ThreadUtil.execute(()->{
+                    lock.lock();
+                    try{
+                        CachedInvocation cachedInvocation = buildCachedInvocation(proceedingJoinPoint, cacheable);
+                        Object o1 = CacheHelper.exeInvocation(cachedInvocation);
+                        redisTemplate.opsForValue().set(key, o1, cacheable.expiredTimeSecond(), TimeUnit.SECONDS);
+                    }catch (Exception e){
+                        log.error("{}",e.getMessage(),e);
+                    }finally {
+                        lock.unlock();
+                    }
+                });
+            }
+            return o;
+        }
+        Object result = proceedingJoinPoint.proceed();
+        redisTemplate.opsForValue().set(key, result, cacheable.expiredTimeSecond(), TimeUnit.SECONDS);
+        return result;
+    }
+
+    @SneakyThrows
+    private Object useCaffeineCache(String key, CustomizedCacheable cacheable, ProceedingJoinPoint proceedingJoinPoint) {
+        MyCaffeineCache myCaffeineCache = (MyCaffeineCache) SpringUtil.getBean(MyCaffeineCache.class);
+        Object o = myCaffeineCache.get(key);
+        if (o != null) {
+            Long ttl = myCaffeineCache.getTtl(key);
+            if(ObjectUtil.isNotEmpty(ttl) && ttl <= cacheable.preLoadTimeSecond()){
+                log.info(">>>>>>>>>>> cacheKey：{}, ttl: {},preLoadTimeSecond: {}",key,ttl,cacheable.preLoadTimeSecond());
+                ThreadUtil.execute(()->{
+                    lock.lock();
+                    try{
+                        CachedInvocation cachedInvocation = buildCachedInvocation(proceedingJoinPoint, cacheable);
+                        Object o1 = CacheHelper.exeInvocation(cachedInvocation);
+                        myCaffeineCache.set(key, o1, cacheable.expiredTimeSecond());
+                    }catch (Exception e){
+                        log.error("{}",e.getMessage(),e);
+                    }finally {
+                        lock.unlock();
+                    }
+                });
+            }
+            return o;
+        }
+        Object result = proceedingJoinPoint.proceed();
+        myCaffeineCache.set(key, result, cacheable.expiredTimeSecond());
+        return result;
+    }
+
 
     private CachedInvocation buildCachedInvocation(ProceedingJoinPoint proceedingJoinPoint,CustomizedCacheable customizedCacheable){
         Method method = this.getSpecificmethod(proceedingJoinPoint);
